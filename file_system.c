@@ -1,122 +1,219 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 
-#define DISK_FILE "virtual_disk.img"
 #define BLOCK_SIZE 256
 #define MAX_BLOCKS 4096
 #define MAX_FILES 128
 
+// Allocation type
+#define ALLOC_CONTIGUOUS 0
+
+// File entry structure
 typedef struct {
-    char name[20];
+    char name[32];
     int start_block;
-    int size;
-    int allocation_type; // 0=contiguous, 1=linked, 2=indexed
+    int size_bytes; // actual content length
+    int blocks_used;
+    int allocation_type;
+    bool used;
 } FileEntry;
 
+// File system structure
 typedef struct {
     FileEntry files[MAX_FILES];
-    int file_count;
+    bool block_map[MAX_BLOCKS];
 } FileSystem;
 
 FileSystem fs;
+FILE *virtual_disk;
 
-// Initialize File System
-void init_fs() {
-    FILE *disk = fopen(DISK_FILE, "rb+");
-    if (!disk) {
-        printf("Error: Virtual disk not found.\n");
-        return;
-    }
-    fs.file_count = 0;
-    fclose(disk);
-}
-
-// Create a new file
-void create_file(const char *filename, int size, int allocation_type) {
-    if (fs.file_count >= MAX_FILES) {
-        printf("Error: File limit reached.\n");
-        return;
-    }
-
-    strcpy(fs.files[fs.file_count].name, filename);
-    fs.files[fs.file_count].size = size;
-    fs.files[fs.file_count].allocation_type = allocation_type;
-    
-    fs.files[fs.file_count].start_block = rand() % MAX_BLOCKS; // Simple allocation logic
-    fs.file_count++;
-    
-    printf("File '%s' created using %s allocation.\n", filename,
-        (allocation_type == 0) ? "Contiguous" : (allocation_type == 1) ? "Linked" : "Indexed");
-}
-
-// List all files
-void list_files() {
-    printf("\nStored Files:\n");
-    for (int i = 0; i < fs.file_count; i++) {
-        printf("Name: %s, Start Block: %d, Size: %d KB, Type: %s\n",
-            fs.files[i].name, fs.files[i].start_block, fs.files[i].size,
-            (fs.files[i].allocation_type == 0) ? "Contiguous" : (fs.files[i].allocation_type == 1) ? "Linked" : "Indexed");
+void init_file_system() {
+    memset(&fs, 0, sizeof(fs));
+    virtual_disk = fopen("virtual_disk.img", "r+b");
+    if (!virtual_disk) {
+        virtual_disk = fopen("virtual_disk.img", "w+b");
+        fseek(virtual_disk, BLOCK_SIZE * MAX_BLOCKS - 1, SEEK_SET);
+        fputc('\0', virtual_disk);
+        fflush(virtual_disk);
     }
 }
 
-// Delete a file
-void delete_file(const char *filename) {
-    int found = 0;
-    for (int i = 0; i < fs.file_count; i++) {
-        if (strcmp(fs.files[i].name, filename) == 0) {
-            found = 1;
-            for (int j = i; j < fs.file_count - 1; j++) {
-                fs.files[j] = fs.files[j + 1];
+void shutdown_file_system() {
+    fclose(virtual_disk);
+}
+
+int find_free_blocks(int blocks_needed) {
+    int count = 0;
+    for (int i = 0; i <= MAX_BLOCKS - blocks_needed; i++) {
+        bool found = true;
+        for (int j = 0; j < blocks_needed; j++) {
+            if (fs.block_map[i + j]) {
+                found = false;
+                break;
             }
-            fs.file_count--;
-            printf("File '%s' deleted successfully.\n", filename);
+        }
+        if (found) return i;
+    }
+    return -1;
+}
+
+void create_file(const char *name, const char *content) {
+    for (int i = 0; i < MAX_FILES; i++) {
+        if (fs.files[i].used && strcmp(fs.files[i].name, name) == 0) {
+            printf("File with this name already exists.\n");
             return;
         }
     }
-    if (!found) {
-        printf("Error: File not found.\n");
+
+    int content_length = strlen(content);
+    int blocks_needed = (content_length + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    int start_block = find_free_blocks(blocks_needed);
+    if (start_block == -1) {
+        printf("Not enough contiguous space available.\n");
+        return;
+    }
+
+    for (int i = start_block; i < start_block + blocks_needed; i++) {
+        fs.block_map[i] = true;
+    }
+
+    for (int i = 0; i < MAX_FILES; i++) {
+        if (!fs.files[i].used) {
+            strcpy(fs.files[i].name, name);
+            fs.files[i].start_block = start_block;
+            fs.files[i].size_bytes = content_length;
+            fs.files[i].blocks_used = blocks_needed;
+            fs.files[i].allocation_type = ALLOC_CONTIGUOUS;
+            fs.files[i].used = true;
+            break;
+        }
+    }
+
+    fseek(virtual_disk, start_block * BLOCK_SIZE, SEEK_SET);
+    fwrite(content, 1, content_length, virtual_disk);
+    fflush(virtual_disk);
+
+    printf("File '%s' created successfully.\n", name);
+}
+
+void list_files() {
+    printf("Files:\n");
+    for (int i = 0; i < MAX_FILES; i++) {
+        if (fs.files[i].used) {
+            printf("- %s (%d bytes, %d blocks used)\n",
+                   fs.files[i].name,
+                   fs.files[i].size_bytes,
+                   fs.files[i].blocks_used);
+        }
     }
 }
 
-// File System Menu
-void file_system_menu() {
+void view_file(const char *name) {
+    for (int i = 0; i < MAX_FILES; i++) {
+        if (fs.files[i].used && strcmp(fs.files[i].name, name) == 0) {
+            char *buffer = malloc(fs.files[i].size_bytes + 1);
+            fseek(virtual_disk, fs.files[i].start_block * BLOCK_SIZE, SEEK_SET);
+            fread(buffer, 1, fs.files[i].size_bytes, virtual_disk);
+            buffer[fs.files[i].size_bytes] = '\0';
+            printf("Content of '%s':\n%s\n", name, buffer);
+            free(buffer);
+            return;
+        }
+    }
+    printf("File not found.\n");
+}
+
+void delete_file(const char *name) {
+    for (int i = 0; i < MAX_FILES; i++) {
+        if (fs.files[i].used && strcmp(fs.files[i].name, name) == 0) {
+            for (int j = fs.files[i].start_block;
+                 j < fs.files[i].start_block + fs.files[i].blocks_used; j++) {
+                fs.block_map[j] = false;
+            }
+            fs.files[i].used = false;
+            printf("File '%s' deleted.\n", name);
+            return;
+        }
+    }
+    printf("File not found.\n");
+}
+
+void edit_file(const char *name, const char *new_content) {
+    for (int i = 0; i < MAX_FILES; i++) {
+        if (fs.files[i].used && strcmp(fs.files[i].name, name) == 0) {
+            int new_length = strlen(new_content);
+            int new_blocks = (new_length + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+            if (new_blocks <= fs.files[i].blocks_used) {
+                fseek(virtual_disk, fs.files[i].start_block * BLOCK_SIZE, SEEK_SET);
+                fwrite(new_content, 1, new_length, virtual_disk);
+                fflush(virtual_disk);
+                fs.files[i].size_bytes = new_length;
+                printf("File '%s' updated successfully.\n", name);
+            } else {
+                printf("New content too large. Please delete and recreate the file.\n");
+            }
+            return;
+        }
+    }
+    printf("File not found.\n");
+}
+
+
+int main() {
+    init_file_system();
+
     int choice;
-    char filename[20];
-    int size, type;
-    
+    char name[32];
+    char content[1024];
+
     while (1) {
-        printf("\n1. Create File\n2. List Files\n3. Delete File\n4. Exit\nChoose an option: ");
+        printf("\n1. Create file\n2. List files\n3. View file\n4. Delete file\n5. Exit\nChoose an option: ");
         scanf("%d", &choice);
-        
+        getchar(); // consume newline
+
         switch (choice) {
             case 1:
-                printf("Enter filename: ");
-                scanf("%s", filename);
-                printf("Enter size (in KB): ");
-                scanf("%d", &size);
-                printf("Enter allocation type (0=Contiguous, 1=Linked, 2=Indexed): ");
-                scanf("%d", &type);
-                create_file(filename, size, type);
+                printf("Enter file name: ");
+                fgets(name, sizeof(name), stdin);
+                name[strcspn(name, "\n")] = '\0';
+                printf("Enter file content: ");
+                fgets(content, sizeof(content), stdin);
+                content[strcspn(content, "\n")] = '\0';
+                create_file(name, content);
                 break;
             case 2:
                 list_files();
                 break;
             case 3:
-                printf("Enter filename to delete: ");
-                scanf("%s", filename);
-                delete_file(filename);
+                printf("Enter file name to view: ");
+                fgets(name, sizeof(name), stdin);
+                name[strcspn(name, "\n")] = '\0';
+                view_file(name);
                 break;
             case 4:
-                return;
+                printf("Enter file name to delete: ");
+                fgets(name, sizeof(name), stdin);
+                name[strcspn(name, "\n")] = '\0';
+                delete_file(name);
+                break;
+            case 5:
+                shutdown_file_system();
+                return 0;
+	case 6:
+                printf("Enter file name to edit: ");
+               fgets(name, sizeof(name), stdin);
+               name[strcspn(name, "\n")] = '\0';
+               printf("Enter new content: ");
+               fgets(content, sizeof(content), stdin);
+               content[strcspn(content, "\n")] = '\0';
+               edit_file(name, content);
+               break;
             default:
-                printf("Invalid option. Try again.\n");
+                printf("Invalid option.\n");
         }
     }
-}
-
-int main() {
-    init_fs();
-    file_system_menu();
-    return 0;
 }
